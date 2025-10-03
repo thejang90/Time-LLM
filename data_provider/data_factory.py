@@ -1,4 +1,10 @@
-from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_M4
+from data_provider.data_loader import (
+    Dataset_Custom,
+    Dataset_ETT_hour,
+    Dataset_ETT_minute,
+    Dataset_M4,
+    Dataset_NYISO,
+)
 from torch.utils.data import DataLoader
 
 data_dict = {
@@ -10,6 +16,7 @@ data_dict = {
     'Traffic': Dataset_Custom,
     'Weather': Dataset_Custom,
     'm4': Dataset_M4,
+    'NYISO': Dataset_NYISO,
 }
 
 
