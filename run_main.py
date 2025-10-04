@@ -18,6 +18,7 @@ os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
 from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
+from utils.losses import PinballLoss
 
 parser = argparse.ArgumentParser(description='Time-LLM')
 
@@ -79,6 +80,12 @@ parser.add_argument('--stride', type=int, default=8, help='stride')
 parser.add_argument('--prompt_domain', type=int, default=0, help='')
 parser.add_argument('--llm_model', type=str, default='LLAMA', help='LLM model') # LLAMA, GPT2, BERT
 parser.add_argument('--llm_dim', type=int, default='4096', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
+parser.add_argument('--enable_stgr', action='store_true', help='Enable spatio-temporal graph reprogramming module')
+parser.add_argument('--graph_heads', type=int, default=4, help='Number of attention heads in the STGR module')
+parser.add_argument('--graph_dropout', type=float, default=0.1, help='Dropout rate for the STGR module')
+parser.add_argument('--enable_dynamic_prompt', action='store_true', help='Enable dynamic contextual prompting for exogenous variables')
+parser.add_argument('--dynamic_prompt_keys', type=str, default='temperature,humidity,holiday', help='Comma separated keys for contextual prompts')
+parser.add_argument('--quantiles', type=str, default='', help='Comma separated quantiles (e.g., 0.1,0.5,0.9) for probabilistic forecasts')
 
 
 # optimization
@@ -99,6 +106,21 @@ parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
 
 args = parser.parse_args()
+if args.quantiles:
+    quantile_values = [float(q.strip()) for q in args.quantiles.split(',') if q.strip()]
+    args.quantiles = quantile_values if quantile_values else None
+else:
+    args.quantiles = None
+
+if args.dynamic_prompt_keys:
+    args.dynamic_prompt_keys = [key.strip() for key in args.dynamic_prompt_keys.split(',') if key.strip()]
+else:
+    args.dynamic_prompt_keys = []
+
+if args.quantiles:
+    args.median_quantile_index = int(np.argmin(np.abs(np.array(args.quantiles) - 0.5)))
+else:
+    args.median_quantile_index = None
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
 accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
@@ -134,6 +156,9 @@ for ii in range(args.itr):
     else:
         model = TimeLLM.Model(args).float()
 
+    if args.enable_stgr and hasattr(train_data, 'adjacency_matrix') and getattr(train_data, 'adjacency_matrix') is not None:
+        model.set_graph_structure(train_data.adjacency_matrix, getattr(train_data, 'locations', None))
+
     path = os.path.join(args.checkpoints,
                         setting + '-' + args.model_comment)  # unique checkpoint saving path
     args.content = load_content(args)
@@ -161,7 +186,10 @@ for ii in range(args.itr):
                                             epochs=args.train_epochs,
                                             max_lr=args.learning_rate)
 
-    criterion = nn.MSELoss()
+    if args.quantiles:
+        criterion = PinballLoss(args.quantiles)
+    else:
+        criterion = nn.MSELoss()
     mae_metric = nn.L1Loss()
 
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
@@ -200,9 +228,13 @@ for ii in range(args.itr):
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                     f_dim = -1 if args.features == 'MS' else 0
-                    outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
-                    loss = criterion(outputs, batch_y)
+                    if args.quantiles:
+                        outputs = outputs[:, -args.pred_len:, f_dim:, :]
+                        target = batch_y[:, -args.pred_len:, f_dim:]
+                    else:
+                        outputs = outputs[:, -args.pred_len:, f_dim:]
+                        target = batch_y[:, -args.pred_len:, f_dim:]
+                    loss = criterion(outputs, target)
                     train_loss.append(loss.item())
             else:
                 if args.output_attention:
@@ -211,9 +243,13 @@ for ii in range(args.itr):
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if args.features == 'MS' else 0
-                outputs = outputs[:, -args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -args.pred_len:, f_dim:]
-                loss = criterion(outputs, batch_y)
+                if args.quantiles:
+                    outputs = outputs[:, -args.pred_len:, f_dim:, :]
+                    target = batch_y[:, -args.pred_len:, f_dim:]
+                else:
+                    outputs = outputs[:, -args.pred_len:, f_dim:]
+                    target = batch_y[:, -args.pred_len:, f_dim:]
+                loss = criterion(outputs, target)
                 train_loss.append(loss.item())
 
             if (i + 1) % 100 == 0:

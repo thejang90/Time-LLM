@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
 from utils.timefeatures import time_features
 from data_provider.m4 import M4Dataset, M4Meta
+from data_provider.nyiso_formatter import NYISODataFormatter
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -205,6 +206,131 @@ class Dataset_ETT_minute(Dataset):
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
 
+
+class Dataset_NYISO(Dataset):
+    def __init__(self, root_path, flag='train', size=None,
+                 features='load', data_path='nyiso.csv',
+                 target='da_load', scale=True, timeenc=0, freq='h', percent=100,
+                 seasonal_patterns=None, context_variables=None):
+        if size is None:
+            self.seq_len = 24 * 4
+            self.label_len = 24 * 2
+            self.pred_len = 24 * 2
+        else:
+            self.seq_len = size[0]
+            self.label_len = size[1]
+            self.pred_len = size[2]
+
+        assert flag in ['train', 'test', 'val']
+        type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = type_map[flag]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+        self.context_variables = context_variables
+
+        self.root_path = root_path
+        self.data_path = data_path
+        self.formatter = NYISODataFormatter()
+        self.__read_data__()
+
+        self.enc_in = self.data_x.shape[-1]
+        self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        raw_path = os.path.join(self.root_path, self.data_path)
+        df_raw = pd.read_csv(raw_path)
+        formatted = self.formatter.format(df_raw)
+        self.locations = self.formatter.locations
+
+        variables = self._resolve_variables()
+        feature_frame = self.formatter.extract_features(formatted, variables=variables)
+        self.context_frame = self.formatter.extract_features(formatted, variables=['da_smp'])
+
+        num_total = len(feature_frame)
+        num_train = int(num_total * 0.7)
+        num_test = int(num_total * 0.2)
+        num_val = num_total - num_train - num_test
+
+        border1s = [0, num_train - self.seq_len, num_total - num_test - self.seq_len]
+        border2s = [num_train, num_train + num_val, num_total]
+
+        border1 = max(border1s[self.set_type], 0)
+        border2 = border2s[self.set_type]
+
+        if self.scale:
+            train_values = feature_frame.iloc[:border2s[0]]
+            self.scaler.fit(train_values.values)
+            data = self.scaler.transform(feature_frame.values)
+        else:
+            data = feature_frame.values
+
+        df_stamp = pd.DataFrame({'date': feature_frame.index})
+        df_stamp['date'] = pd.to_datetime(df_stamp['date'])
+        if self.timeenc == 0:
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday())
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour)
+            data_stamp = df_stamp.drop(['date'], axis=1).values
+        elif self.timeenc == 1:
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = data_stamp.transpose(1, 0)
+        else:
+            data_stamp = np.zeros((len(feature_frame), 0))
+
+        self.data_x = data[border1:border2]
+        self.data_y = data[border1:border2]
+        self.data_stamp = data_stamp[border1:border2]
+        self.timestamps = feature_frame.index[border1:border2]
+
+        try:
+            self.adjacency_matrix = self.formatter.build_adjacency()
+        except ValueError:
+            self.adjacency_matrix = None
+
+    def _resolve_variables(self):
+        feature_key = str(self.features).lower()
+        if feature_key in {'s', 'single', 'load'}:
+            return [self.target]
+        if feature_key in {'price'}:
+            return ['da_smp']
+        return ['da_load', 'da_smp']
+
+    def __getitem__(self, index):
+        s_begin = index
+        s_end = s_begin + self.seq_len
+
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
+
+        seq_x = self.data_x[s_begin:s_end]
+        seq_y = self.data_y[r_begin:r_end]
+
+        seq_x_mark = self.data_stamp[s_begin:s_end]
+        seq_y_mark = self.data_stamp[r_begin:r_end]
+
+        return (
+            seq_x.astype(np.float32),
+            seq_y.astype(np.float32),
+            seq_x_mark.astype(np.float32),
+            seq_y_mark.astype(np.float32)
+        )
+
+    def __len__(self):
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
+
+    def get_context_slice(self, start: int, end: int):
+        if self.context_frame is None:
+            return None
+        return self.context_frame.iloc[start:end]
 
 class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,

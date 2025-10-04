@@ -87,3 +87,22 @@ class mase_loss(nn.Module):
         masep = t.mean(t.abs(insample[:, freq:] - insample[:, :-freq]), dim=1)
         masked_masep_inv = divide_no_nan(mask, masep[:, None])
         return t.mean(t.abs(target - forecast) * masked_masep_inv)
+
+
+class PinballLoss(nn.Module):
+    def __init__(self, quantiles):
+        super().__init__()
+        if not quantiles:
+            raise ValueError('Quantiles must be provided for PinballLoss.')
+        self.register_buffer('quantiles', t.tensor(list(quantiles), dtype=t.float32))
+
+    def forward(self, preds: t.Tensor, target: t.Tensor) -> t.Tensor:
+        """Compute the pinball loss for multiple quantiles."""
+
+        if preds.shape[:-1] != target.shape:
+            raise ValueError('Predictions and targets must align except for quantile dimension.')
+
+        quantiles = self.quantiles.to(preds.device)
+        diff = target.unsqueeze(-1) - preds
+        loss = t.maximum((quantiles - 1.0) * diff, quantiles * diff)
+        return loss.mean()

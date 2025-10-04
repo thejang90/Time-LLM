@@ -1,4 +1,5 @@
 from math import sqrt
+from typing import List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -8,22 +9,30 @@ from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GP
 from layers.Embed import PatchEmbedding
 import transformers
 from layers.StandardNorm import Normalize
+from layers.stgr import SpatialGraphReprogramming
+from utils.contextual_prompt import DynamicContextPromptBuilder
 
 transformers.logging.set_verbosity_error()
 
 
 class FlattenHead(nn.Module):
-    def __init__(self, n_vars, nf, target_window, head_dropout=0):
+    def __init__(self, n_vars, nf, target_window, head_dropout=0, quantiles: Optional[Sequence[float]] = None):
         super().__init__()
         self.n_vars = n_vars
+        self.target_window = target_window
         self.flatten = nn.Flatten(start_dim=-2)
-        self.linear = nn.Linear(nf, target_window)
+        self.quantiles = list(quantiles) if quantiles else None
+        out_features = target_window if self.quantiles is None else target_window * len(self.quantiles)
+        self.linear = nn.Linear(nf, out_features)
         self.dropout = nn.Dropout(head_dropout)
 
     def forward(self, x):
         x = self.flatten(x)
         x = self.linear(x)
         x = self.dropout(x)
+        if self.quantiles:
+            bsz, n_vars, _ = x.shape
+            x = x.view(bsz, n_vars, self.target_window, len(self.quantiles))
         return x
 
 
@@ -39,6 +48,27 @@ class Model(nn.Module):
         self.d_llm = configs.llm_dim
         self.patch_len = configs.patch_len
         self.stride = configs.stride
+
+        self.quantiles: Optional[List[float]] = None
+        if hasattr(configs, 'quantiles') and configs.quantiles:
+            self.quantiles = sorted({float(q) for q in configs.quantiles})
+        self.median_quantile_index: Optional[int] = None
+        if self.quantiles:
+            self.median_quantile_index = int(
+                min(range(len(self.quantiles)), key=lambda i: abs(self.quantiles[i] - 0.5))
+            )
+
+        self.enable_stgr = getattr(configs, 'enable_stgr', False)
+        self.graph_heads = getattr(configs, 'graph_heads', 4)
+        self.graph_dropout = getattr(configs, 'graph_dropout', configs.dropout)
+        self.enable_dynamic_prompt = getattr(configs, 'enable_dynamic_prompt', False)
+        self.dynamic_prompt_keys = getattr(configs, 'dynamic_prompt_keys', None)
+        if isinstance(self.dynamic_prompt_keys, str):
+            self.dynamic_prompt_keys = [self.dynamic_prompt_keys]
+
+        self._graph_adj: Optional[torch.Tensor] = None
+        self._graph_locations: Optional[Sequence[str]] = None
+        self._external_context: Optional[Sequence] = None
 
         if configs.llm_model == 'LLAMA':
             # self.llama_config = LlamaConfig.from_pretrained('/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/')
@@ -173,6 +203,23 @@ class Model(nn.Module):
         self.patch_embedding = PatchEmbedding(
             configs.d_model, self.patch_len, self.stride, configs.dropout)
 
+        self.spatial_reprogrammer: Optional[SpatialGraphReprogramming] = None
+        if self.enable_stgr:
+            hidden_channels = getattr(configs, 'graph_hidden', configs.d_model)
+            self.spatial_reprogrammer = SpatialGraphReprogramming(
+                num_nodes=configs.enc_in,
+                in_channels=configs.d_model,
+                hidden_channels=hidden_channels,
+                heads=self.graph_heads,
+                dropout=self.graph_dropout,
+            )
+
+        self.dynamic_prompt_builder = (
+            DynamicContextPromptBuilder(self.dynamic_prompt_keys)
+            if self.enable_dynamic_prompt
+            else None
+        )
+
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
         self.vocab_size = self.word_embeddings.shape[0]
         self.num_tokens = 1000
@@ -185,7 +232,8 @@ class Model(nn.Module):
 
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
-                                                 head_dropout=configs.dropout)
+                                                 head_dropout=configs.dropout,
+                                                 quantiles=self.quantiles)
         else:
             raise NotImplementedError
 
@@ -194,6 +242,8 @@ class Model(nn.Module):
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+            if self.quantiles:
+                return dec_out[:, -self.pred_len:, :, :]
             return dec_out[:, -self.pred_len:, :]
         return None
 
@@ -231,6 +281,17 @@ class Model(nn.Module):
 
         x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
 
+        if self.enable_dynamic_prompt and self.dynamic_prompt_builder is not None:
+            if self._external_context is not None:
+                context_prompts = self.dynamic_prompt_builder(self._external_context, self.pred_len)
+            else:
+                context_prompts = ["No additional external context provided."] * len(prompt)
+            prompt = [
+                text.replace("<|<end_prompt>|>", f" External context: {context_prompts[idx]}<|<end_prompt>|>")
+                for idx, text in enumerate(prompt)
+            ]
+            self._external_context = None
+
         prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
 
@@ -238,6 +299,8 @@ class Model(nn.Module):
 
         x_enc = x_enc.permute(0, 2, 1).contiguous()
         enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
+        if self.enable_stgr and self.spatial_reprogrammer is not None:
+            enc_out = self._apply_spatial_graph(enc_out, n_vars, x_enc.device)
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
@@ -248,8 +311,13 @@ class Model(nn.Module):
         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
 
         dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
-        dec_out = dec_out.permute(0, 2, 1).contiguous()
 
+        if self.quantiles:
+            dec_out = dec_out.permute(0, 3, 1, 2).contiguous()
+            dec_out = self._denormalize_quantiles(dec_out.to(torch.float32))
+            return dec_out
+
+        dec_out = dec_out.permute(0, 2, 1).contiguous()
         dec_out = self.normalize_layers(dec_out, 'denorm')
 
         return dec_out
@@ -262,6 +330,47 @@ class Model(nn.Module):
         mean_value = torch.mean(corr, dim=1)
         _, lags = torch.topk(mean_value, self.top_k, dim=-1)
         return lags
+
+    def _apply_spatial_graph(self, enc_out: torch.Tensor, n_vars: int, device: torch.device) -> torch.Tensor:
+        if enc_out.shape[0] % n_vars != 0:
+            return enc_out
+        batch = enc_out.shape[0] // n_vars
+        patches = enc_out.shape[1]
+        channels = enc_out.shape[2]
+        spatial_input = enc_out.view(batch, n_vars, patches, channels).to(torch.float32)
+
+        if self._graph_adj is None:
+            adjacency = torch.eye(n_vars, device=device, dtype=torch.float32)
+        elif isinstance(self._graph_adj, torch.Tensor):
+            adjacency = self._graph_adj.to(device=device, dtype=torch.float32)
+        else:
+            adjacency = torch.tensor(self._graph_adj, dtype=torch.float32, device=device)
+
+        spatial_out = self.spatial_reprogrammer(spatial_input, adjacency)
+        return spatial_out.view(batch * n_vars, patches, channels).to(enc_out.dtype)
+
+    def _denormalize_quantiles(self, tensor: torch.Tensor) -> torch.Tensor:
+        mean = getattr(self.normalize_layers, 'mean', None)
+        stdev = getattr(self.normalize_layers, 'stdev', None)
+        if mean is None or stdev is None:
+            return tensor
+        mean = mean.to(tensor.device)
+        stdev = stdev.to(tensor.device)
+        tensor = tensor * stdev.unsqueeze(1).unsqueeze(-1)
+        tensor = tensor + mean.unsqueeze(1).unsqueeze(-1)
+        return tensor
+
+    def set_graph_structure(self, adjacency, locations: Optional[Sequence[str]] = None):
+        if adjacency is None:
+            return
+        if isinstance(adjacency, torch.Tensor):
+            self._graph_adj = adjacency.float()
+        else:
+            self._graph_adj = torch.tensor(adjacency, dtype=torch.float32)
+        self._graph_locations = locations
+
+    def update_exogenous_context(self, context_batch: Sequence):
+        self._external_context = context_batch
 
 
 class ReprogrammingLayer(nn.Module):

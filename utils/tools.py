@@ -166,15 +166,21 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
             outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
 
             f_dim = -1 if args.features == 'MS' else 0
-            outputs = outputs[:, -args.pred_len:, f_dim:]
-            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
-
-            pred = outputs.detach()
-            true = batch_y.detach()
-
-            loss = criterion(pred, true)
-
-            mae_loss = mae_metric(pred, true)
+            if args.quantiles:
+                outputs = outputs[:, -args.pred_len:, f_dim:, :]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+                loss = criterion(outputs, batch_y)
+                median_idx = args.median_quantile_index if args.median_quantile_index is not None else 0
+                pred = outputs[..., median_idx].detach()
+                true = batch_y.detach()
+                mae_loss = mae_metric(pred, true)
+            else:
+                outputs = outputs[:, -args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+                pred = outputs.detach()
+                true = batch_y.detach()
+                loss = criterion(pred, true)
+                mae_loss = mae_metric(pred, true)
 
             total_loss.append(loss.item())
             total_mae_loss.append(mae_loss.item())
