@@ -127,6 +127,10 @@ for ii in range(args.itr):
     vali_data, vali_loader = data_provider(args, 'val')
     test_data, test_loader = data_provider(args, 'test')
 
+    args.enc_in = train_data.enc_in
+    args.dec_in = args.enc_in
+    args.c_out = args.enc_in
+
     if args.model == 'Autoformer':
         model = Autoformer.Model(args).float()
     elif args.model == 'DLinear':
