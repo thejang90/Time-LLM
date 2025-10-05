@@ -337,14 +337,15 @@ class Model(nn.Module):
         batch = enc_out.shape[0] // n_vars
         patches = enc_out.shape[1]
         channels = enc_out.shape[2]
-        spatial_input = enc_out.view(batch, n_vars, patches, channels).to(torch.float32)
+        spatial_dtype = self.spatial_reprogrammer.input_projection.weight.dtype
+        spatial_input = enc_out.view(batch, n_vars, patches, channels).to(dtype=spatial_dtype)
 
         if self._graph_adj is None:
-            adjacency = torch.eye(n_vars, device=device, dtype=torch.float32)
+            adjacency = torch.eye(n_vars, device=device, dtype=spatial_dtype)
         elif isinstance(self._graph_adj, torch.Tensor):
-            adjacency = self._graph_adj.to(device=device, dtype=torch.float32)
+            adjacency = self._graph_adj.to(device=device, dtype=spatial_dtype)
         else:
-            adjacency = torch.tensor(self._graph_adj, dtype=torch.float32, device=device)
+            adjacency = torch.tensor(self._graph_adj, dtype=spatial_dtype, device=device)
 
         spatial_out = self.spatial_reprogrammer(spatial_input, adjacency)
         return spatial_out.view(batch * n_vars, patches, channels).to(enc_out.dtype)
