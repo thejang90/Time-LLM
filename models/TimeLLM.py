@@ -337,16 +337,16 @@ class Model(nn.Module):
         batch = enc_out.shape[0] // n_vars
         patches = enc_out.shape[1]
         channels = enc_out.shape[2]
-        spatial_dtype = self.spatial_reprogrammer.input_projection.weight.dtype
-        spatial_input = enc_out.view(batch, n_vars, patches, channels).to(dtype=spatial_dtype)
+        spatial_input = enc_out.view(batch, n_vars, patches, channels)
+        target_dtype = spatial_input.dtype
 
         if self._graph_adj is None:
-            adjacency = torch.eye(n_vars, device=device, dtype=spatial_dtype)
+            adjacency = torch.eye(n_vars, device=device, dtype=target_dtype)
         else:
             if isinstance(self._graph_adj, torch.Tensor):
-                adjacency = self._graph_adj.to(device=device, dtype=spatial_dtype)
+                adjacency = self._graph_adj.to(device=device)
             else:
-                adjacency = torch.tensor(self._graph_adj, dtype=spatial_dtype, device=device)
+                adjacency = torch.tensor(self._graph_adj, device=device)
 
             if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
                 raise ValueError(
@@ -373,7 +373,10 @@ class Model(nn.Module):
                     f"Loaded adjacency size {adjacency_size} exceeds n_vars={n_vars}."
                 )
 
-        spatial_out = self.spatial_reprogrammer(spatial_input, adjacency)
+        if adjacency.dtype != torch.bool:
+            adjacency = adjacency.to(dtype=target_dtype)
+        # The adjacency mask must either remain boolean or share the query dtype to avoid AMP regressions.
+        spatial_out = self.spatial_reprogrammer(spatial_input.to(dtype=target_dtype), adjacency)
         return spatial_out.view(batch * n_vars, patches, channels).to(enc_out.dtype)
 
     def _denormalize_quantiles(self, tensor: torch.Tensor) -> torch.Tensor:
