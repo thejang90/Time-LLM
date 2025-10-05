@@ -1,0 +1,2 @@
+NYISO day-ahead market dataset describing hourly load and SMP for each NYISO zone.
+The prompt should mention spatial coupling between zones and key exogenous drivers.
