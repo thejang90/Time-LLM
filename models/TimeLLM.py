@@ -342,10 +342,36 @@ class Model(nn.Module):
 
         if self._graph_adj is None:
             adjacency = torch.eye(n_vars, device=device, dtype=spatial_dtype)
-        elif isinstance(self._graph_adj, torch.Tensor):
-            adjacency = self._graph_adj.to(device=device, dtype=spatial_dtype)
         else:
-            adjacency = torch.tensor(self._graph_adj, dtype=spatial_dtype, device=device)
+            if isinstance(self._graph_adj, torch.Tensor):
+                adjacency = self._graph_adj.to(device=device, dtype=spatial_dtype)
+            else:
+                adjacency = torch.tensor(self._graph_adj, dtype=spatial_dtype, device=device)
+
+            if adjacency.ndim != 2 or adjacency.shape[0] != adjacency.shape[1]:
+                raise ValueError(
+                    f"Loaded adjacency must be a square matrix, got shape {tuple(adjacency.shape)}."
+                )
+
+            adjacency_size = adjacency.shape[0]
+            if adjacency_size == n_vars:
+                pass
+            elif adjacency_size < n_vars:
+                if n_vars % adjacency_size != 0:
+                    raise ValueError(
+                        "Loaded adjacency size must evenly divide n_vars when it is smaller. "
+                        f"Received adjacency with size {adjacency_size} for n_vars={n_vars}."
+                    )
+                repeat_factor = n_vars // adjacency_size
+                adjacency = adjacency.repeat_interleave(repeat_factor, dim=0)
+                adjacency = adjacency.repeat_interleave(repeat_factor, dim=1)
+                assert adjacency.shape[0] == n_vars == adjacency.shape[1], (
+                    "Expanded adjacency should match the number of variables after repeating."
+                )
+            else:
+                raise ValueError(
+                    f"Loaded adjacency size {adjacency_size} exceeds n_vars={n_vars}."
+                )
 
         spatial_out = self.spatial_reprogrammer(spatial_input, adjacency)
         return spatial_out.view(batch * n_vars, patches, channels).to(enc_out.dtype)
