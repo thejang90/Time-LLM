@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.utils import weight_norm
 import math
+from typing import Sequence
 
 
 class PositionalEmbedding(nn.Module):
@@ -182,7 +183,54 @@ class PatchEmbedding(nn.Module):
         x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
         # Input encoding
         x = self.value_embedding(x)
-        return self.dropout(x), n_vars
+        return self.dropout(x), n_vars, x.shape[1]
+
+
+class MultiResolutionPatchEmbedding(nn.Module):
+    """Compose several patch embedders to capture multi-scale patterns."""
+
+    def __init__(
+        self,
+        d_model: int,
+        patch_lengths: Sequence[int],
+        strides: Sequence[int],
+        dropout: float,
+        learnable_scale: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(patch_lengths) != len(strides):
+            raise ValueError("patch_lengths and strides must have the same length")
+        if not patch_lengths:
+            raise ValueError("At least one patch scale must be provided")
+
+        self.embedders = nn.ModuleList(
+            [PatchEmbedding(d_model, patch_len, stride, dropout) for patch_len, stride in zip(patch_lengths, strides)]
+        )
+
+        self.learnable_scale = learnable_scale and len(self.embedders) > 1
+        if self.learnable_scale:
+            self.scale_weights = nn.Parameter(torch.ones(len(self.embedders)))
+        else:
+            self.register_buffer("scale_weights", torch.ones(len(self.embedders)), persistent=False)
+
+    def forward(self, x):
+        embeddings = []
+        patch_counts = []
+        n_vars = None
+
+        weights = (
+            torch.softmax(self.scale_weights, dim=0)
+            if self.learnable_scale
+            else self.scale_weights / self.scale_weights.sum()
+        )
+
+        for weight, embedder in zip(weights, self.embedders):
+            emb, n_vars, patches = embedder(x)
+            embeddings.append(emb * weight)
+            patch_counts.append(patches)
+
+        combined = torch.cat(embeddings, dim=1)
+        return combined, n_vars, patch_counts
 
 
 class DataEmbedding_wo_time(nn.Module):
