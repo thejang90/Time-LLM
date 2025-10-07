@@ -76,6 +76,32 @@ class DynamicContextPromptBuilder:
             avg_hum = float(np.mean(hum))
             return f"Average humidity around {avg_hum:.0f}% over the horizon."
 
+        if key_lower in {"load", "demand", "demand_forecast"}:
+            demand = self._to_float_array(value)
+            if demand.size == 0:
+                return ""
+            mean_demand = float(np.mean(demand))
+            peak_demand = float(np.max(demand))
+            return (
+                f"Expected electric demand averages {mean_demand:.1f} MW with peak {peak_demand:.1f} MW, "
+                f"guiding dispatch for the next {horizon} steps."
+            )
+
+        if key_lower in {"congestion", "constraint", "lmp_spread"}:
+            congestion = self._to_float_array(value)
+            if congestion.size == 0:
+                return ""
+            severe = bool(np.any(congestion > 0.7))
+            severity = "severe" if severe else "manageable"
+            return f"Transmission congestion remains {severity} with mean index {float(np.mean(congestion)):.2f}."
+
+        if key_lower in {"wind", "wind_forecast", "solar", "solar_forecast"}:
+            renewable = self._to_float_array(value)
+            if renewable.size == 0:
+                return ""
+            avg_renewable = float(np.mean(renewable))
+            return f"Renewable output expected near {avg_renewable:.1f} MW across the horizon."
+
         if key_lower in {"holiday", "is_holiday"}:
             indicator = self._to_float_array(value)
             if indicator.size == 0:

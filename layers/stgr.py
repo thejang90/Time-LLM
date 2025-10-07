@@ -17,6 +17,7 @@ class SpatialGraphReprogramming(nn.Module):
         hidden_channels: Optional[int] = None,
         heads: int = 4,
         dropout: float = 0.1,
+        node_feature_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         hidden_channels = hidden_channels or in_channels
@@ -32,8 +33,16 @@ class SpatialGraphReprogramming(nn.Module):
         self.output_projection = nn.Linear(hidden_channels, in_channels)
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.GELU()
+        self.node_feature_proj: Optional[nn.Linear] = None
+        if node_feature_dim:
+            self.node_feature_proj = nn.Linear(node_feature_dim, hidden_channels)
 
-    def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        adjacency: torch.Tensor,
+        node_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Apply graph-aware attention.
 
         Parameters
@@ -54,6 +63,20 @@ class SpatialGraphReprogramming(nn.Module):
         attention_mask = self._build_attention_mask(adjacency)
 
         x = self.input_projection(x)
+
+        if node_features is not None and self.node_feature_proj is not None:
+            node_features = node_features.to(x.device)
+            if node_features.dim() == 2:
+                node_features = node_features.unsqueeze(0)
+            if node_features.size(1) != nodes:
+                raise ValueError(
+                    f"Node feature dimension {node_features.size(1)} does not match number of nodes {nodes}."
+                )
+            feature_bias = self.node_feature_proj(node_features)
+            if feature_bias.size(0) == 1:
+                feature_bias = feature_bias.expand(batch, -1, -1)
+            x = x + feature_bias.unsqueeze(2)
+
         x = x.view(batch * patches, nodes, -1)
 
         attended, _ = self.attention(
